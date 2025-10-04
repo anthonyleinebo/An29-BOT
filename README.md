@@ -54,15 +54,13 @@ The bot plays music from YouTube with slash commands and will find and pick high
 ---
 
 ## 📦 Dependencies
-Listed in requirements.txt:
-    ```bash
-    discord.py[voice]==2.4.0
-    yt-dlp>=2025.1.1
-    python-dotenv>=1.0.1
+Listed in `requirements.txt`:
 
-    # Remember: FFmpeg must be installed separately on your system
-    ```
-
+```txt
+discord.py[voice]==2.4.0
+yt-dlp>=2025.1.1
+python-dotenv>=1.0.1
+```
 ---
 
 ## 👤 Credits  
