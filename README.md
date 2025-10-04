@@ -1,4 +1,4 @@
-# An29 BOT
+# An29 BOT 💻
 
 A modern Discord music bot built with [discord.py](https://github.com/Rapptz/discord.py) and [yt-dlp](https://github.com/yt-dlp/yt-dlp).  
 The bot plays music from YouTube with slash commands and will find and pick highest audio quality available.
@@ -23,8 +23,8 @@ The bot plays music from YouTube with slash commands and will find and pick high
 
 1. **Clone the repo**
    ```bash
-   git clone https://github.com/<your-username>/<repo-name>.git
-   cd <repo-name>
+   git clone https://github.com/anthonyleinebo/An29-BOT.git
+   cd An29-BOT
    ```
 
 2. **Install dependencies***
