@@ -79,4 +79,4 @@ Under the following terms:
 - **Attribution** — You must give proper credit to the original author.  
 - **NonCommercial** — You may not use the bot or its code for commercial purposes.  
 
-Full license text: [LICENSE](LICENSE)  
+Full license text: [LICENSE](https://github.com/anthonyleinebo/An29-BOT?tab=License-1-ov-file)  
