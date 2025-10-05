@@ -1,4 +1,14 @@
 # music.py
+"""
+Music subsystem: queue, track extraction (yt-dlp), and voice playback.
+
+- Extracts best Opus/PCM streams via yt-dlp.
+- Prefers Opus with a bitrate cap based on channel bitrate; falls back to PCM.
+- Provides a per-guild MusicPlayer with an asyncio queue and an idle disconnect.
+"""
+
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 from typing import Optional
@@ -7,6 +17,7 @@ import discord
 from discord import VoiceClient
 from yt_dlp import YoutubeDL
 
+# yt-dlp configuration: prioritize Opus in WebM, fallback to best
 YTDL_OPTS = {
     "format": "bestaudio[ext=webm][acodec=opus]/bestaudio/best",
     "quiet": True,
@@ -14,24 +25,32 @@ YTDL_OPTS = {
     "noplaylist": True,
     "source_address": "0.0.0.0",
     "extract_flat": False,
+    "nocheckcertificate": True,  # reduces SSL fuss on some hosts/networks
 }
 _ytdl = YoutubeDL(YTDL_OPTS)
 
+
 def ffmpeg_volume_filter(vol: float) -> str:
-    """FFmpeg volume-filter (0.0–1.5) for Opus-pathen."""
+    """Return an FFmpeg volume filter for 0.0–1.5 (empty if ~1.0)."""
     v = max(0.0, min(1.5, vol))
     return f'-filter:a "volume={v}"' if abs(v - 1.0) > 1e-3 else ""
 
+
 @dataclass
 class Track:
+    """Represents a playable audio track."""
     title: str
-    url: str            # yt-URL
-    stream_url: str     # url-FFmpeg
+    url: str            # YouTube watch URL (or original query if not resolved)
+    stream_url: str     # Direct media URL for FFmpeg
     duration: Optional[int] = None
     requester: Optional[discord.Member] = None
 
     @classmethod
     async def create(cls, query: str, requester: Optional[discord.Member] = None) -> "Track":
+        """
+        Resolve a query (URL or search) to a playable stream with yt-dlp.
+        Falls back to alternate YouTube clients if SABR/PO tokens get in the way.
+        """
         loop = asyncio.get_running_loop()
 
         def _extract(q, opts=None):
@@ -41,14 +60,16 @@ class Track:
                 return alt.extract_info(q, download=False)
 
         data = await loop.run_in_executor(None, lambda: _extract(query))
+
         if "entries" in data:
+            # search result or playlist entry: pick the first valid hit
             data = next((e for e in data["entries"] if e), None)
             if data is None:
                 raise RuntimeError("Fant ingen treff.")
 
         stream = data.get("url")
 
-        # Fallback  om SABR/PO-token kødda  igjen
+        # Fallback: try alternate player clients (ios/tv) in case of token issues
         if not stream:
             alt_opts = {"extractor_args": {"youtube": {"player_client": ["ios", "tv"]}}}
             data = await loop.run_in_executor(None, lambda: _extract(query, alt_opts))
@@ -68,22 +89,29 @@ class Track:
             requester=requester,
         )
 
+
 class MusicPlayer:
-    """Én instans per guild – håndterer kø, avspilling og voice."""
+    """
+    Per-guild music player with:
+    - asyncio.Queue for tracks
+    - single playback task
+    - idle disconnect timer
+    """
     def __init__(self, guild: discord.Guild):
         self.guild = guild
         self.queue: asyncio.Queue[Track] = asyncio.Queue()
         self.next_event = asyncio.Event()
         self.current: Optional[Track] = None
         self.player_task: Optional[asyncio.Task] = None
-        # standardvolum
-        self.volume = 0.35
-        self.idle_disconnect_after = 900  # 15 min ish uten aktivitet
 
-    # ---- Public API brukt av bot.py ----
+        # defaults
+        self.volume = 0.35
+        self.idle_disconnect_after = 900  # seconds
+
+    # ---- Public API used by bot.py ----
     async def enqueue(self, track: Track):
         await self.queue.put(track)
-        print(f"🎵 Enqueued: {track.title} ({track.stream_url})")
+        print(f"🎵 Enqueued: {track.title}")
         self.ensure_task()
 
     async def skip(self):
@@ -117,7 +145,7 @@ class MusicPlayer:
             vc.resume()
 
     async def set_volume(self, vol: float):
-        """Sett volum 0.0–1.5 (Opus-path via FFmpeg filter, PCM via transformer)."""
+        """Set logical volume in [0.0, 1.5]. Opus path uses FFmpeg filter, PCM path uses transformer."""
         self.volume = max(0.0, min(1.5, vol))
 
     def ensure_task(self):
@@ -129,31 +157,34 @@ class MusicPlayer:
     def _voice(self) -> Optional[VoiceClient]:
         return self.guild.voice_client
 
-    async def connect(self, channel: discord.VoiceChannel):
+    async def connect(self, channel: discord.VoiceChannel) -> VoiceClient:
+        """
+        Connect to/move to the given voice channel.
+        Returns the VoiceClient once connected and ready.
+        """
         vc = self._voice
-        try:
-            if vc and vc.channel and vc.channel.id == channel.id and vc.is_connected():
-                return vc
-            if vc and vc.is_connected():
-                await vc.move_to(channel, timeout=10)
-            else:
-                vc = await channel.connect(self_deaf=True, timeout=10, reconnect=False)
-
-            for _ in range(15):  # ~3 sek TODO seinare
-                await asyncio.sleep(0.2)
-                if vc.is_connected():
-                    break
-
-            if not vc or not vc.is_connected():
-                raise RuntimeError("Voice handshake failed (mulig brannmur/UDP blokkerer).")
-
+        if vc and vc.channel and vc.channel.id == channel.id and vc.is_connected():
             return vc
 
-        except Exception:
-            raise
+        if vc and vc.is_connected():
+            await vc.move_to(channel, timeout=10)
+        else:
+            vc = await channel.connect(self_deaf=True, timeout=10, reconnect=False)
 
-    # ---- Hoved-avspillingsløkken ----
+        # wait briefly for the state to settle (voice handshake)
+        for _ in range(15):  # ~3 seconds total
+            await asyncio.sleep(0.2)
+            if vc.is_connected():
+                break
+
+        if not vc or not vc.is_connected():
+            raise RuntimeError("Voice handshake failed (mulig brannmur/UDP blokkerer).")
+
+        return vc
+
+    # ---- Core playback loop ----
     async def _player_loop(self):
+        # ensure we are self-deaf to reduce echo/noise
         if self._voice:
             try:
                 await self.guild.change_voice_state(
@@ -198,7 +229,7 @@ class MusicPlayer:
                     print(f"[player] FFmpeg error: {err}")
                 done_event.set()
 
-            # === Ta høgast OPUS-bitrate til vc om mulig ===
+            # Choose a target Opus bitrate capped by channel bitrate
             channel_bps = getattr(vc.channel, "bitrate", 128_000) or 128_000
             cap_kbps = max(64, min(256, channel_bps // 1000))
             target_kbps = 192 if cap_kbps >= 192 else cap_kbps
@@ -241,6 +272,7 @@ class MusicPlayer:
                     start_idle_timer()
                     continue
 
+            # Give FFmpeg/voice pipeline a moment to start
             await asyncio.sleep(2.0)
             if not vc.is_playing():
                 print("[player] Opus stoppet for tidlig / ikke i gang → bytter til PCM.")
@@ -252,12 +284,10 @@ class MusicPlayer:
                     start_idle_timer()
                     continue
 
+            # Wait for either playback end or a skip request
             done_waiter = asyncio.create_task(done_event.wait())
             skip_waiter = asyncio.create_task(self.next_event.wait())
-            done, pending = await asyncio.wait(
-                {done_waiter, skip_waiter},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            done, pending = await asyncio.wait({done_waiter, skip_waiter}, return_when=asyncio.FIRST_COMPLETED)
             for p in pending:
                 p.cancel()
 
@@ -272,6 +302,7 @@ class MusicPlayer:
             start_idle_timer()
 
     async def _idle_disconnect_task(self):
+        """Disconnect from voice after a long idle period."""
         try:
             await asyncio.sleep(self.idle_disconnect_after)
             if not self.current and self.queue.empty():
@@ -282,7 +313,9 @@ class MusicPlayer:
         except asyncio.CancelledError:
             pass
 
+
 class PlayerPool(dict[int, MusicPlayer]):
+    """Simple registry for per-guild MusicPlayer instances."""
     def get_player(self, guild: discord.Guild) -> MusicPlayer:
         if guild.id not in self:
             self[guild.id] = MusicPlayer(guild)

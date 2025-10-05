@@ -1,7 +1,17 @@
 # bot.py
+"""
+Discord music bot application entrypoint.
+
+- Keeps user-facing strings in Norwegian (server audience),
+  while comments and docstrings are in English.
+- Adds light input validation, permission checks, and clearer error messages.
+- Introduces small cooldowns to avoid accidental spam.
+"""
+
+from __future__ import annotations
+
 import os
 import asyncio
-
 import itertools
 from typing import Optional
 
@@ -12,22 +22,24 @@ from dotenv import load_dotenv
 
 from music import PlayerPool, Track
 
-# --- Last inn .env ---
+# --- Load .env and token ---
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # --- Intents ---
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
-INTENTS.voice_states = True
+INTENTS.voice_states = True  # needed to see/join voice channels
 
+# --- Bot / Command tree ---
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 players = PlayerPool()
 
 
-# --- Hjelpefunksjoner ---
+# -------------------------- Helpers --------------------------
 def fmt_duration(seconds: Optional[int]) -> str:
+    """Format a duration in seconds to h:mm:ss or m:ss. Returns 'live' on None/0."""
     if not seconds:
         return "live"
     m, s = divmod(seconds, 60)
@@ -36,7 +48,7 @@ def fmt_duration(seconds: Optional[int]) -> str:
 
 
 async def get_user_voice_channel(interaction: discord.Interaction) -> Optional[discord.VoiceChannel]:
-    """Returner brukerens voice-kanal, eller None uten å svare i interaksjonen."""
+    """Return the user's current voice channel in this guild, or None."""
     assert interaction.guild
     user = interaction.user
     if isinstance(user, discord.Member) and user.voice and user.voice.channel:
@@ -44,10 +56,21 @@ async def get_user_voice_channel(interaction: discord.Interaction) -> Optional[d
     return None
 
 
-# --- Kommandoer ---
+def bot_has_connect_speak(interaction: discord.Interaction, channel: discord.VoiceChannel) -> bool:
+    """Check that the bot has Connect and Speak permissions in a given channel."""
+    guild = interaction.guild
+    me = guild.get_member(bot.user.id) if (guild and bot.user) else None
+    if not me:
+        return False
+    perms = channel.permissions_for(me)
+    return perms.connect and perms.speak
+
+
+# -------------------------- Commands --------------------------
 @tree.command(name="ping", description="Test at boten svarer raskt.")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("🏓 Pong!", ephemeral=True)
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! `{latency_ms} ms`", ephemeral=True)
 
 
 @tree.command(name="join", description="Bli med i talekanalen din (uten å starte avspilling).")
@@ -55,11 +78,15 @@ async def join(interaction: discord.Interaction):
     if not interaction.guild:
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=False)
+    await interaction.response.defer(ephemeral=True)
 
     channel = await get_user_voice_channel(interaction)
     if not channel:
         await interaction.followup.send("❌ Du må være i en talekanal for å bruke denne kommandoen.", ephemeral=True)
+        return
+
+    if not bot_has_connect_speak(interaction, channel):
+        await interaction.followup.send("🚫 Jeg mangler **Connect**/**Speak** i denne talekanalen.", ephemeral=True)
         return
 
     player = players.get_player(interaction.guild)
@@ -76,6 +103,7 @@ async def join(interaction: discord.Interaction):
 
 @tree.command(name="play", description="Spill av en sang fra YouTube (lenke eller søk).")
 @app_commands.describe(query="YouTube-lenke eller søk (f.eks. 'lofi hip hop')")
+@app_commands.checks.cooldown(2, 5.0)  # 2 uses per 5s per-user (mild anti-spam)
 async def play(interaction: discord.Interaction, query: str):
     if not interaction.guild:
         return
@@ -84,14 +112,19 @@ async def play(interaction: discord.Interaction, query: str):
 
     channel = await get_user_voice_channel(interaction)
     if not channel:
-        await interaction.followup.send("❌ Du må være i en talekanal for å bruke denne kommandoen.", ephemeral=True)
+        await interaction.followup.send("❌ Du må være i en talekanall for å bruke denne kommandoen.", ephemeral=True)
+        return
+
+    if not bot_has_connect_speak(interaction, channel):
+        await interaction.followup.send("🚫 Jeg mangler **Connect**/**Speak** i denne talekanalen.", ephemeral=True)
         return
 
     player = players.get_player(interaction.guild)
     await player.connect(channel)
 
     try:
-        track = await Track.create(query, requester=interaction.user if isinstance(interaction.user, discord.Member) else None)
+        req_member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        track = await Track.create(query, requester=req_member)
     except Exception as e:
         await interaction.followup.send(f"❌ Fikk ikke hentet lydkilde: `{e}`")
         return
@@ -115,20 +148,23 @@ async def play(interaction: discord.Interaction, query: str):
 async def queue_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return
+
     player = players.get_player(interaction.guild)
     current = player.current
-    items = list(player.queue._queue)
+    items = list(player.queue._queue)  # safe view; asyncio.Queue uses a deque internally
 
     desc = ""
     if current:
-        desc += f"**▶️ Spiller nå:** [{current.title}]({current.url}) — `{fmt_duration(current.duration)}`\n\n"
+        dur = fmt_duration(current.duration) if current.duration else "live"
+        desc += f"**▶️ Spiller nå:** [{current.title}]({current.url}) — `{dur}`\n\n"
     else:
         desc += "_Ingen sang spiller nå._\n\n"
 
     if items:
         lines = []
         for i, t in enumerate(itertools.islice(items, 10), start=1):
-            lines.append(f"`{i:02d}.` [{t.title}]({t.url}) — `{fmt_duration(t.duration)}`")
+            d = fmt_duration(t.duration) if t.duration else "live"
+            lines.append(f"`{i:02d}.` [{t.title}]({t.url}) — `{d}`")
         more = len(items) - 10
         if more > 0:
             lines.append(f"... og **{more}** til")
@@ -140,6 +176,7 @@ async def queue_cmd(interaction: discord.Interaction):
 
 
 @tree.command(name="skip", description="Hopp over nåværende sang.")
+@app_commands.checks.cooldown(2, 5.0)
 async def skip(interaction: discord.Interaction):
     if not interaction.guild:
         return
@@ -189,6 +226,7 @@ async def volume(interaction: discord.Interaction, value: float):
     await player.set_volume(value)
     await interaction.response.send_message(f"🔊 Volum satt til {value:.2f} (gjelder fra neste sang).")
 
+
 @tree.command(name="help", description="Vis en oversikt over alle kommandoene.")
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -196,34 +234,27 @@ async def help_cmd(interaction: discord.Interaction):
         description="Her er en oversikt over kommandoene:",
         color=discord.Color.blurple()
     )
-
     embed.add_field(name="▶️ /play <søk eller lenke>", value="Spill en sang fra YouTube.", inline=False)
     embed.add_field(name="📜 /queue", value="Se hva som spilles nå og resten av køen.", inline=False)
-    embed.add_field(name="⏭️ /skip", value="Hopp over sangen", inline=False)
+    embed.add_field(name="⏭️ /skip", value="Hopp over sangen.", inline=False)
     embed.add_field(name="⏹️ /stop", value="Stopp musikken og koble fra voice.", inline=False)
     embed.add_field(name="⏸️ /pause", value="Pause avspillingen.", inline=False)
     embed.add_field(name="▶️ /resume", value="Fortsett etter pause.", inline=False)
     embed.add_field(name="🔊 /volume <0.0–1.5>", value="Juster volumet (gjelder fra neste sang).", inline=False)
-    embed.add_field(name="🔗 /join", value="Koble boten til voicechannel", inline=False)
-    embed.add_field(name="🏓 /ping", value="🏓 PONG!", inline=False)
-    embed.add_field(name="ℹ️ /help", value="Viser detette", inline=False)
+    embed.add_field(name="🔗 /join", value="Koble boten til voicechannel.", inline=False)
+    embed.add_field(name="🏓 /ping", value="Test responstid (Pong!).", inline=False)
+    embed.add_field(name="ℹ️ /help", value="Viser denne oversikten.", inline=False)
 
     if bot.user and bot.user.avatar:
         embed.set_thumbnail(url=bot.user.avatar.url)
-        embed.set_footer(
-            text="@anthonyleinebo om du har features eller fant en feil 😎",
-            icon_url="https://cdn.discordapp.com/avatars/163711118357823488/94e589444fb113b5bf5180a18f4d72b0.webp?size=128"
-        )
+        embed.set_footer(text="@anthonyleinebo – meld features/bugs 😎")
     else:
-        embed.set_footer(text="@anthonyleinebo om du har features eller fant en feil 😎")
+        embed.set_footer(text="@anthonyleinebo – meld features/bugs 😎")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-
-
-
-# --- Event hooks ---
+# -------------------------- Event hooks --------------------------
 @bot.event
 async def on_ready():
     try:
@@ -231,23 +262,38 @@ async def on_ready():
         print(f"Synced {len(tree.get_commands())} app commands.")
     except Exception as e:
         print("Kunne ikke sync'e slash-commands:", e)
-    print(f"Logget inn som {bot.user} (ID: {bot.user.id})")
+    if bot.user:
+        print(f"Logget inn som {bot.user} (ID: {bot.user.id})")
 
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    """
+    Global handler for app command errors (e.g., cooldowns).
+    Tries to reply ephemerally to avoid cluttering channels.
+    """
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(f"⚠️ Feil: {error}", ephemeral=True)
+        msg = None
+        if isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"⌛ Litt kjapp der! Prøv igjen om `{error.retry_after:.1f}s`."
+        elif isinstance(error, app_commands.CheckFailure):
+            msg = "🚫 Du har ikke tilgang til å bruke denne kommandoen."
         else:
-            await interaction.response.send_message(f"⚠️ Feil: {error}", ephemeral=True)
+            msg = f"⚠️ Feil: {error}"
+
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
-        pass
+        pass  # swallow to avoid secondary exceptions in error path
     import traceback
     traceback.print_exception(error)
 
-# --- Main ---
+
+# -------------------------- Main --------------------------
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ Manglende DISCORD_TOKEN i .env")
+    # Discord.py handles loop lifecycle internally
     bot.run(TOKEN, log_handler=None)
